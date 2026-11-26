@@ -1480,4 +1480,164 @@ mod tests {
 
         assert!(resources.glyph_resources.is_some());
     }
+
+    /// Render a 3x1 rectangle filled with a linear gradient whose hard edge sits at
+    /// the middle. The center pixel lies exactly at `t = 0.5` and samples the LUT
+    /// cell covered by the range between the two edge stops, which is the cell that
+    /// used to extrapolate into an unrelated color.
+    fn render_hard_edge_row(
+        edge_left: f32,
+        edge_right: f32,
+        left: vello_common::color::AlphaColor<vello_common::color::Srgb>,
+        right: vello_common::color::AlphaColor<vello_common::color::Srgb>,
+    ) -> [PremulRgba8; 3] {
+        use vello_common::color::DynamicColor;
+        use vello_common::kurbo::Point;
+        use vello_common::peniko::{ColorStop, ColorStops, Gradient, LinearGradientPosition};
+
+        let gradient = Gradient {
+            kind: LinearGradientPosition {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(3.0, 0.0),
+            }
+            .into(),
+            stops: ColorStops::from(
+                [
+                    ColorStop {
+                        offset: 0.0,
+                        color: DynamicColor::from_alpha_color(left),
+                    },
+                    ColorStop {
+                        offset: edge_left,
+                        color: DynamicColor::from_alpha_color(left),
+                    },
+                    ColorStop {
+                        offset: edge_right,
+                        color: DynamicColor::from_alpha_color(right),
+                    },
+                    ColorStop {
+                        offset: 1.0,
+                        color: DynamicColor::from_alpha_color(right),
+                    },
+                ]
+                .as_slice(),
+            ),
+            ..Default::default()
+        };
+
+        let mut ctx = RenderContext::new(3, 1);
+        ctx.set_paint(gradient);
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 3.0, 1.0));
+        ctx.flush();
+
+        let mut resources = Resources::new();
+        let mut pixmap = Pixmap::new(3, 1);
+        ctx.render(&mut pixmap, &mut resources);
+
+        [
+            pixmap.sample(0, 0),
+            pixmap.sample(1, 0),
+            pixmap.sample(2, 0),
+        ]
+    }
+
+    /// A hard edge modeled with two stops at 0.49999988 and 0.5 must not produce a
+    /// color that belongs to neither stop. The pixel on the edge must be either the
+    /// left or the right stop color, never white.
+    #[test]
+    fn gradient_near_coincident_hard_edge_has_no_white_pixel() {
+        use vello_common::color::palette::css::{BLACK, BLUE, GRAY, RED};
+
+        let gray = GRAY.premultiply().to_rgba8();
+        let black = BLACK.premultiply().to_rgba8();
+
+        let [left, edge, right] = render_hard_edge_row(0.49999988, 0.5, GRAY, BLACK);
+        assert_eq!(left, gray);
+        assert!(
+            edge == gray || edge == black,
+            "edge pixel must be gray or black, got {edge:?}"
+        );
+        assert_eq!(right, black);
+
+        // Same invariant for a red-to-blue hard edge: no color outside red and blue.
+        let red = RED.premultiply().to_rgba8();
+        let blue = BLUE.premultiply().to_rgba8();
+
+        let [left, edge, right] = render_hard_edge_row(0.49999988, 0.5, RED, BLUE);
+        assert_eq!(left, red);
+        assert!(
+            edge == red || edge == blue,
+            "edge pixel must be red or blue, got {edge:?}"
+        );
+        assert_eq!(right, blue);
+    }
+
+    /// With both stops exactly at 0.5 the edge keeps its existing rendering: the
+    /// center pixel holds the left color and the right pixel the right color.
+    #[test]
+    fn gradient_coincident_hard_edge_is_unchanged() {
+        use vello_common::color::palette::css::{BLACK, GRAY};
+
+        let [left, edge, right] = render_hard_edge_row(0.5, 0.5, GRAY, BLACK);
+
+        assert_eq!(left, GRAY.premultiply().to_rgba8());
+        assert_eq!(edge, GRAY.premultiply().to_rgba8());
+        assert_eq!(right, BLACK.premultiply().to_rgba8());
+    }
+
+    /// An ordinary smooth gray-to-black gradient over the full range still traverses
+    /// the whole ramp instead of collapsing into a single shade.
+    #[test]
+    fn gradient_smooth_ramp_keeps_intermediate_tones() {
+        use vello_common::color::DynamicColor;
+        use vello_common::color::palette::css::{BLACK, GRAY};
+        use vello_common::kurbo::Point;
+        use vello_common::peniko::{ColorStop, ColorStops, Gradient, LinearGradientPosition};
+
+        let gradient = Gradient {
+            kind: LinearGradientPosition {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(64.0, 0.0),
+            }
+            .into(),
+            stops: ColorStops::from(
+                [
+                    ColorStop {
+                        offset: 0.0,
+                        color: DynamicColor::from_alpha_color(GRAY),
+                    },
+                    ColorStop {
+                        offset: 1.0,
+                        color: DynamicColor::from_alpha_color(BLACK),
+                    },
+                ]
+                .as_slice(),
+            ),
+            ..Default::default()
+        };
+
+        let mut ctx = RenderContext::new(64, 1);
+        ctx.set_paint(gradient);
+        ctx.fill_rect(&Rect::new(0.0, 0.0, 64.0, 1.0));
+        ctx.flush();
+
+        let mut resources = Resources::new();
+        let mut pixmap = Pixmap::new(64, 1);
+        ctx.render(&mut pixmap, &mut resources);
+
+        let first = pixmap.sample(0, 0);
+        let middle = pixmap.sample(31, 0);
+        let last = pixmap.sample(63, 0);
+
+        // The ramp still goes from gray on the left through a darker middle tone to
+        // black on the right, and the two sides are not swapped. Allow one
+        // quantization step for the 8-bit LUT.
+        assert!(
+            first.r.abs_diff(128) <= 1,
+            "first pixel must be gray, got {first:?}"
+        );
+        assert!(last.r <= 1, "last pixel must be black, got {last:?}");
+        assert!(middle.r < first.r, "middle tone must be darker than gray");
+        assert!(middle.r > last.r, "middle tone must be lighter than black");
+    }
 }

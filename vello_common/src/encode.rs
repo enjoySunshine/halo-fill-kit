@@ -379,6 +379,7 @@ fn encode_stops(
         }
 
         GradientRange {
+            x0,
             x1,
             bias,
             scale,
@@ -874,6 +875,8 @@ impl BitEq for GradientCacheKey {
 /// An encoded range between two color stops.
 #[derive(Debug, Clone)]
 pub struct GradientRange {
+    /// The start value of the range.
+    pub x0: f32,
     /// The end value of the range.
     pub x1: f32,
     /// A bias to apply when interpolating the color (in this case just the values of the start
@@ -1106,9 +1109,21 @@ impl<T: GradientLutExt> GradientLut<T> {
         for (ramp_range, range) in ramps {
             let biases = f32x16::block_splat(f32x4::from_slice(simd, &range.bias));
             let scales = f32x16::block_splat(f32x4::from_slice(simd, &range.scale));
+            let lo = f32x4::splat(simd, range.x0);
+            let hi = f32x4::splat(simd, range.x1);
 
             ramp_range.clone().step_by(4).for_each(|idx| {
                 let t_vals = f32x4::splat(simd, idx as f32).mul_add(inv_lut_scale, add_factor);
+
+                // A range may cover only a single LUT cell, which happens when two stops are
+                // placed at nearly (but not quite) the same offset to model a hard edge. The
+                // parameter of that cell does not necessarily lie between the two stop offsets,
+                // so evaluating the linear interpolation would extrapolate, potentially producing
+                // colors far outside of the stop colors (e.g. white between gray and black).
+                // Clamp the parameter to the range's own interval so every sampled color is always
+                // bounded by the colors of the two adjacent stops. This leaves ordinary (wider)
+                // ranges unchanged because their cell parameters already fall inside the interval.
+                let t_vals = t_vals.max(lo).min(hi);
 
                 let t_vals = element_wise_splat(simd, t_vals);
 
@@ -1626,5 +1641,108 @@ mod tests {
             panic!("expected an image paint");
         };
         assert!(encoded.transform.is_finite(), "inverse must be finite");
+    }
+
+    /// A hard edge whose two stops are almost (but not quite) at the same offset must
+    /// only produce colors that lie between the two stop colors. In particular, the
+    /// single LUT cell covered by the narrow range must not extrapolate into a color
+    /// that belongs to neither stop (e.g. white between gray and black).
+    #[test]
+    fn gradient_hard_edge_near_coincident_stops() {
+        use crate::color::palette::css::{BLACK, GRAY, RED};
+        use crate::fearless_simd::Fallback;
+
+        let gray = GRAY; // (0.5019608, 0.5019608, 0.5019608, 1.0)
+
+        for (left, right, label) in [(gray, BLACK, "gray to black"), (RED, BLUE, "red to blue")] {
+            for alpha_space in [
+                InterpolationAlphaSpace::Premultiplied,
+                InterpolationAlphaSpace::Unpremultiplied,
+            ] {
+                let gradient = Gradient {
+                    kind: LinearGradientPosition {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(64.0, 0.0),
+                    }
+                    .into(),
+                    stops: ColorStops(smallvec![
+                        ColorStop {
+                            offset: 0.0,
+                            color: DynamicColor::from_alpha_color(left),
+                        },
+                        ColorStop {
+                            offset: 0.49999988,
+                            color: DynamicColor::from_alpha_color(left),
+                        },
+                        ColorStop {
+                            offset: 0.5,
+                            color: DynamicColor::from_alpha_color(right),
+                        },
+                        ColorStop {
+                            offset: 1.0,
+                            color: DynamicColor::from_alpha_color(right),
+                        },
+                    ]),
+                    interpolation_alpha_space: alpha_space,
+                    ..Default::default()
+                };
+
+                let mut paints = vec![];
+                gradient.encode_into(&mut paints, Affine::IDENTITY, None);
+                let EncodedPaint::Gradient(encoded) = &paints[0] else {
+                    panic!("expected a gradient paint");
+                };
+
+                let simd = Fallback::new();
+
+                // Every f32 LUT cell must lie within the range spanned by the two stop colors.
+                for (idx, rgba) in encoded.f32_lut(simd).lut().iter().enumerate() {
+                    for component in 0..4 {
+                        let lo = left.components[component].min(right.components[component]);
+                        let hi = left.components[component].max(right.components[component]);
+                        let value = rgba[component];
+                        assert!(
+                            value >= lo - 1e-6 && value <= hi + 1e-6,
+                            "{label} ({alpha_space:?}): f32 LUT cell {idx} component {component} \
+                             = {value} is outside the stop range [{lo}, {hi}] (rgba = {rgba:?})"
+                        );
+                    }
+                }
+
+                // Same invariant for the u8 LUT (with one quantization step of tolerance).
+                for (idx, rgba) in encoded.u8_lut(simd).lut().iter().enumerate() {
+                    for component in 0..4 {
+                        let lo = left.components[component].min(right.components[component]);
+                        let hi = left.components[component].max(right.components[component]);
+                        let value = rgba[component] as f32 / 255.0;
+                        assert!(
+                            value >= lo - 1.0 / 255.0 - 1e-6 && value <= hi + 1.0 / 255.0 + 1e-6,
+                            "{label} ({alpha_space:?}): u8 LUT cell {idx} component {component} \
+                             = {value} is outside the stop range [{lo}, {hi}] (rgba = {rgba:?})"
+                        );
+                    }
+                }
+
+                // The edge stays local: the cells next to the edge still hold the stop
+                // colors, and the cell on the edge is one of the two stop colors rather
+                // than an unrelated color such as white.
+                if label == "gray to black" {
+                    let lut = encoded.u8_lut(simd);
+                    let sample = |x: u32| {
+                        let t = (x as f32 + 0.5) / 64.0;
+                        let idx = (t * lut.scale_factor()) as usize;
+                        lut.get(idx)
+                    };
+
+                    assert_eq!(sample(31), [128, 128, 128, 255]);
+                    assert!(
+                        sample(32) == [128, 128, 128, 255] || sample(32) == [0, 0, 0, 255],
+                        "edge cell must be gray or black, got {:?}",
+                        sample(32)
+                    );
+                    assert_eq!(sample(33), [0, 0, 0, 255]);
+                }
+            }
+        }
     }
 }

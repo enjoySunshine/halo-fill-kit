@@ -28,6 +28,10 @@ guillotiere = { workspace = true }
 libm = { version = "0.2.16", optional = true }
 log = { workspace = true }
 
+[dev-dependencies]
+# Required so tests can construct the scalar `Fallback` SIMD token.
+fearless_simd = { workspace = true, features = ["force_support_fallback"] }
+
 [features]
 # If adding new features, also document in `src/lib.rs`
 default = ["std", "png"]
